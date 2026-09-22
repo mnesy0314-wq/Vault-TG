@@ -264,7 +264,7 @@ HiOS — всё это видно через `resolveActivity()` и
 ## Разработка
 
 ```sh
-bash tests/run-all.sh      # 292 проверки, устройство не нужно
+bash tests/run-all.sh      # 330 проверки, устройство не нужно
 bash tools/build-zip.sh    # собрать zip
 ```
 

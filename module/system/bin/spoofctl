@@ -104,13 +104,17 @@ validate() {
     echo "1. Экран"
     _sc_ov="$(dev_override)"
     if [ -n "$_sc_ov" ]; then
-        err "активен wm override: $(echo "$_sc_ov" | tr '\n' ' ')"
+        # Предупреждение, а не отказ. Override экрана — осознанный размен
+        # владельца (обычно ради производительности в играх), и решение
+        # принимать его — не наше. Но цена должна быть названа.
+        warn "активен wm override: $(echo "$_sc_ov" | tr '\n' ' ')"
         echo "     Физическая панель: $(dev_display) @ $(dev_density) dpi"
-        echo "     DisplayMetrics покажет override, а Display.getMode() —"
-        echo "     физические пиксели. Расхождение видно любому приложению"
-        echo "     без разрешений и выдаёт устройство сильнее, чем модель."
-        echo "     Сначала:  wm size reset && wm density reset"
-        _sc_rc=1
+        echo "     DisplayMetrics отдаёт override, а Display.getMode() —"
+        echo "     физические пиксели: wm их не подменяет. Расхождение видно"
+        echo "     любому приложению без разрешений."
+        echo "     Пока override активен, подмена модели даёт заметно меньше:"
+        echo "     сам override — более редкое значение, чем название модели."
+        echo "     Убрать, если передумаешь:  wm size reset && wm density reset"
     else
         good "override нет, панель $(dev_display) @ $(dev_density) dpi"
     fi
@@ -195,7 +199,41 @@ validate() {
     }
 
     _sc_cmp "платформа"   "$(profile_meta "$_sc_file" platform)"  "$(dev_platform)" || _sc_rc=1
-    _sc_cmp "SoC"         "$(profile_meta "$_sc_file" soc_model)" "$(dev_soc)"      || _sc_rc=1
+
+    # SoC: разные правила для вендора и для бина.
+    #
+    # Платформа (ums9230) — жёсткое требование: по ней подбираются
+    # вендорные библиотеки, и расхождение вскрывается первым же запросом.
+    #
+    # Бин внутри платформы (T606 / T612 / T615 / T616) — предупреждение.
+    # Все они на ums9230, с одним Mali-G57 MP1 и одной топологией ядер,
+    # так что /proc/cpuinfo и GL_RENDERER совпадут. Разойдётся только
+    # Build.SOC_MODEL: писать ro.soc.model запрещено (это создало бы
+    # противоречие с кодеками и cpuinfo), поэтому он останется настоящим.
+    # Это одно известное расхождение, и владелец вправе его принять.
+    #
+    # Отдельно: частота. T606 идёт на 1.6 ГГц, T612/T615 на 1.8 ГГц, и
+    # cpuinfo_max_freq это выдаёт. Поэтому T606-цели названы отдельно.
+    _sc_psoc="$(profile_meta "$_sc_file" soc_model)"
+    _sc_dsoc="$(dev_soc)"
+    if [ -z "$_sc_psoc" ]; then
+        warn "SoC: в профиле не указан"
+    elif [ "$_sc_psoc" = "$_sc_dsoc" ]; then
+        good "SoC: $_sc_dsoc"
+    else
+        warn "SoC: профиль заявляет '$_sc_psoc', устройство — '$_sc_dsoc'"
+        echo "     Платформа совпадает, отличается бин чипа. Build.SOC_MODEL"
+        echo "     останется '$_sc_dsoc': писать ro.soc.model запрещено, иначе"
+        echo "     он разойдётся с именами кодеков и /proc/cpuinfo."
+        echo "     Это единственное известное расхождение такого профиля."
+        case "$_sc_psoc" in
+            T606|t606)
+                err "     T606 работает на 1.6 ГГц, а этот чип на 1.8 ГГц."
+                echo "     Частота читается из cpuinfo_max_freq без разрешений —"
+                echo "     это расхождение заметнее, чем выигрыш от профиля."
+                _sc_rc=1 ;;
+        esac
+    fi
     _sc_cmp "ядра"        "$(profile_meta "$_sc_file" core_count)" "$(dev_cores)"   || _sc_rc=1
     _sc_cmp "Android"     "$(profile_meta "$_sc_file" release)"   "$(dev_release)"  || _sc_rc=1
     _sc_cmp "панель"      "$(profile_meta "$_sc_file" display)"   "$(dev_display)"  || _sc_rc=1

@@ -80,9 +80,12 @@ printf '%s' "$out" | grep -q 'в пределах 25%' && ok "память св�
 
 echo
 echo "== предусловие: override экрана =="
+# Override — осознанный выбор владельца (производительность), поэтому
+# предупреждение, а не запрет. Но цена обязана быть названа.
 out="$(FAKE="$WORK/dev-override.sh" sc check "$WORK/good.conf")"
-if [ "$(FAKE="$WORK/dev-override.sh" scrc check "$WORK/good.conf")" != "0" ]; then ok "профиль отвергнут при активном override"; else bad "override не заблокировал профиль"; fi
-printf '%s' "$out" | grep -q 'wm size reset' && ok "подсказано, как исправить" || bad "нет подсказки"
+if [ "$(FAKE="$WORK/dev-override.sh" scrc check "$WORK/good.conf")" = "0" ]; then ok "override не блокирует применение профиля"; else bad "override заблокировал профиль"; fi
+printf '%s' "$out" | grep -q 'активен wm override' && ok "предупреждение показано" || bad "нет предупреждения"
+printf '%s' "$out" | grep -q 'wm size reset' && ok "сказано, как убрать, если передумает" || bad "нет подсказки"
 
 echo
 echo "== запрещённые свойства =="
@@ -105,13 +108,28 @@ printf '%s' "$out" | grep -q 'Build.FINGERPRINT.startsWith' && ok "показа�
 
 echo
 echo "== несовместимость с железом =="
-for case_ in "platform:mt6768:платформа" "soc_model:T612:SoC" "core_count:4:ядра" \
+for case_ in "platform:mt6768:платформа" "core_count:4:ядра" \
              "display:1080x2400:панель" "low_ram:false:low_ram" "release:15:Android"; do
     key="${case_%%:*}"; rest="${case_#*:}"; val="${rest%%:*}"; label="${rest##*:}"
     mk_profile "$WORK/hw.conf"
     sed -i "s|^@${key}=.*|@${key}=${val}|" "$WORK/hw.conf"
     if [ "$(scrc check "$WORK/hw.conf")" != "0" ]; then ok "отвергнут: $label заявлен как $val"; else bad "пропущено расхождение: $label=$val"; fi
 done
+
+echo
+echo "== SoC: бин чипа против вендора =="
+# T612 на той же платформе ums9230 — предупреждение: расходится только
+# Build.SOC_MODEL, всё остальное железо совпадает.
+mk_profile "$WORK/soc.conf"; sed -i 's/^@soc_model=.*/@soc_model=T612/' "$WORK/soc.conf"
+out="$(sc check "$WORK/soc.conf")"
+[ "$(scrc check "$WORK/soc.conf")" = "0" ] && ok "другой бин той же платформы принят" || bad "бин той же платформы отвергнут"
+printf '%s' "$out" | grep -q 'Build.SOC_MODEL' && ok "расхождение названо явно" || bad "расхождение не названо"
+
+# T606 идёт на 1.6 ГГц против 1.8 — это читается из cpuinfo_max_freq.
+mk_profile "$WORK/soc606.conf"; sed -i 's/^@soc_model=.*/@soc_model=T606/' "$WORK/soc606.conf"
+out="$(sc check "$WORK/soc606.conf")"
+[ "$(scrc check "$WORK/soc606.conf")" != "0" ] && ok "T606 отвергнут (другая частота)" || bad "T606 принят"
+printf '%s' "$out" | grep -q '1.6 ГГц' && ok "названа причина отказа по T606" || bad "причина не названа"
 
 echo
 echo "== память: допуск 25% =="
@@ -173,8 +191,15 @@ fi
 
 # apply обязан перепроверять: override могли включить после import.
 rm -f "$MOD/system.prop"
-[ "$(FAKE="$WORK/dev-override.sh" scrc apply)" != "0" ] && ok "apply перепроверяет условия (override появился после import)" || bad "apply применил профиль при активном override"
+[ "$(FAKE="$WORK/dev-override.sh" scrc apply)" = "0" ] && ok "apply работает при активном override (предупреждение, не запрет)" || bad "override заблокировал apply"
+# но перепроверка сама по себе обязана работать: профиль, ставший
+# невалидным после import, применяться не должен
+rm -f "$MOD/system.prop"
+cp "$WORK/good.conf" "$CONF/profile.conf"
+sed -i 's/^@platform=.*/@platform=mt6768/' "$CONF/profile.conf"
+[ "$(scrc apply)" != "0" ] && ok "apply перепроверяет профиль, а не доверяет import" || bad "apply применил невалидный профиль"
 [ ! -f "$MOD/system.prop" ] && ok "system.prop не создан при отказе" || bad "system.prop создан несмотря на отказ"
+cp "$WORK/good.conf" "$CONF/profile.conf"
 
 sc apply >/dev/null 2>&1
 [ "$(scrc revert)" = "0" ] && ok "revert отработал" || bad "revert упал"
