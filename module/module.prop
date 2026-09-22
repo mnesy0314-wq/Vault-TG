@@ -1,0 +1,6 @@
+id=coherence
+name=Coherence - device identity
+version=v0.1.0
+versionCode=1
+author=built with Claude Code
+description=Applies a device-identity profile only if it stays coherent with the hardware this phone actually has. Ships no profile and does nothing until one is imported and validated. Read the README before use: Build.* is worth single-digit bits against real tracking.
