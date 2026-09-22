@@ -82,7 +82,12 @@ section() { printf '\n== %s ==\n' "$1"; }
 
 # Перебирает свойство по всем партициям Android 10+.
 # Порядок важен: именно так его резолвит init.
-PARTITIONS='system system_ext product odm vendor vendor_dlkm bootimage'
+# init принимает как источник ТОЛЬКО {odm, product, system_ext, system, vendor}
+# (property_service.cpp, RO_PRODUCT_PROPS_ALLOWED_SOURCES). Остальные
+# перечислены потому, что их всё равно читает getprop из приложения:
+# уцелевшее ro.product.bootimage.model рядом с подменённым базовым —
+# сигнал громче исходной модели.
+PARTITIONS='system system_ext product odm vendor vendor_dlkm odm_dlkm system_dlkm bootimage'
 per_partition() {
     _key="$1"
     p "ro.product.$_key"
