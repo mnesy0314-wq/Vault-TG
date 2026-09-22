@@ -1,0 +1,380 @@
+#!/system/bin/sh
+#
+# spoofctl — управление профилем идентичности.
+#
+# Единственный путь, которым профиль попадает в модуль. Проверок четыре,
+# и профиль обязан пройти все:
+#
+#   1. denylist     — нет ключей, ломающих устройство
+#   2. fingerprint  — 8 полей сходятся со своими же свойствами
+#   3. железо       — заявленное устройство совместимо с реальным
+#   4. экран        — нет активного wm override
+#
+# Ни одна не является предупреждением. Профиль, не прошедший проверку,
+# не применяется: некогерентная подмена делает устройство уникальным,
+# то есть работает против собственной цели.
+
+set -u
+
+MODDIR="${COHERENCE_MODDIR:-/data/adb/modules/coherence}"
+CONF="${COHERENCE_CONF:-/data/adb/coherence}"
+PROFILE="$CONF/profile.conf"
+
+. "$MODDIR/common/fingerprint.sh" 2>/dev/null || { echo "нет $MODDIR/common/fingerprint.sh"; exit 1; }
+. "$MODDIR/common/denylist.sh"    2>/dev/null || { echo "нет $MODDIR/common/denylist.sh"; exit 1; }
+
+RED=''; GRN=''; YLW=''; RST=''
+if [ -t 1 ]; then RED=$(printf '\033[31m'); GRN=$(printf '\033[32m'); YLW=$(printf '\033[33m'); RST=$(printf '\033[0m'); fi
+
+err()  { echo "${RED}✗${RST} $1"; }
+good() { echo "${GRN}✓${RST} $1"; }
+warn() { echo "${YLW}!${RST} $1"; }
+
+need_root() {
+    [ "$(id -u 2>/dev/null)" = "0" ] || { err "нужен root: su -c 'spoofctl $*'"; exit 1; }
+}
+
+# ------------------------------------------------------- замеры устройства ---
+#
+# Всё, что подменой не скрывается. Профиль сверяется с этими значениями.
+
+dev_platform() { getprop ro.board.platform; }
+dev_soc()      { getprop ro.soc.model; }
+dev_low_ram()  { getprop ro.config.low_ram; }
+dev_release()  { getprop ro.build.version.release; }
+dev_density()  { getprop ro.sf.lcd_density; }
+dev_abilist()  { getprop ro.product.cpu.abilist; }
+
+dev_cores() {
+    if command -v nproc >/dev/null 2>&1; then nproc --all 2>/dev/null && return; fi
+    grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 0
+}
+
+dev_ram_kb() { awk '/^MemTotal/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 0; }
+
+
+# Физическое разрешение панели. Именно физическое: его сообщает
+# Display.getMode(), и wm override на него не влияет.
+dev_display() {
+    wm size 2>/dev/null | sed -n 's/^Physical size: *\([0-9]*x[0-9]*\).*/\1/p' | head -1
+}
+
+# Активен ли override. Это предусловие, а не придирка: приложение сравнивает
+# DisplayMetrics с Display.getMode() и видит расхождение бесплатно.
+dev_override() {
+    _sc_s="$(wm size 2>/dev/null | sed -n 's/.*Override size: *\([0-9]*x[0-9]*\).*/\1/p' | head -1)"
+    _sc_d="$(wm density 2>/dev/null | sed -n 's/.*Override density: *\([0-9]*\).*/\1/p' | head -1)"
+    [ -n "$_sc_s" ] && echo "размер=$_sc_s"
+    [ -n "$_sc_d" ] && echo "плотность=$_sc_d"
+}
+
+# Тестовый хук. Замеры устройства — это то, на чём стоит вся проверка
+# совместимости, поэтому она обязана проверяться автотестами на заведомых
+# значениях, а не только на живом телефоне. В обычной работе переменной нет.
+if [ -n "${COHERENCE_FAKE_DEV:-}" ] && [ -f "${COHERENCE_FAKE_DEV}" ]; then
+    . "${COHERENCE_FAKE_DEV}"
+fi
+
+# ------------------------------------------------------- разбор профиля ---
+#
+# Строки '@ключ=значение' — ограничения, они проверяются и НЕ пишутся.
+# Остальные 'ключ=значение' — свойства, они пишутся.
+
+profile_meta() {
+    sed -n "s/^@${2}=//p" "$1" 2>/dev/null | head -1
+}
+
+profile_props() {
+    grep -v '^@' "$1" 2>/dev/null | grep -v '^[[:space:]]*#' | grep '=' 
+}
+
+# ------------------------------------------------------------ проверка ---
+
+validate() {
+    _sc_file="$1"
+    _sc_rc=0
+    fp_reset_errors
+
+    echo "Проверка профиля: $_sc_file"
+    echo
+
+    [ -f "$_sc_file" ] || { err "файл не найден"; return 1; }
+
+    # --- 1. Предусловие: override экрана -----------------------------------
+    echo "1. Экран"
+    _sc_ov="$(dev_override)"
+    if [ -n "$_sc_ov" ]; then
+        err "активен wm override: $(echo "$_sc_ov" | tr '\n' ' ')"
+        echo "     Физическая панель: $(dev_display) @ $(dev_density) dpi"
+        echo "     DisplayMetrics покажет override, а Display.getMode() —"
+        echo "     физические пиксели. Расхождение видно любому приложению"
+        echo "     без разрешений и выдаёт устройство сильнее, чем модель."
+        echo "     Сначала:  wm size reset && wm density reset"
+        _sc_rc=1
+    else
+        good "override нет, панель $(dev_display) @ $(dev_density) dpi"
+    fi
+    echo
+
+    # --- 2. Запрещённые ключи ----------------------------------------------
+    echo "2. Запрещённые свойства"
+    _sc_tmp="${TMPDIR:-/data/local/tmp}/spoofctl.props.$$"
+    profile_props "$_sc_file" > "$_sc_tmp" 2>/dev/null
+    if deny_scan_profile "$_sc_tmp"; then
+        good "запрещённых ключей нет ($(grep -c . "$_sc_tmp" 2>/dev/null) свойств)"
+    else
+        err "профиль содержит свойства, которые модуль не пишет"
+        _sc_rc=1
+    fi
+    rm -f "$_sc_tmp"
+    echo
+
+    # --- 3. Когерентность fingerprint --------------------------------------
+    echo "3. Когерентность fingerprint"
+    _sc_fp="$(sed -n 's/^ro\.build\.fingerprint=//p' "$_sc_file" | head -1)"
+    if [ -z "$_sc_fp" ]; then
+        err "в профиле нет ro.build.fingerprint"
+        _sc_rc=1
+    else
+        _sc_len=$(printf '%s' "$_sc_fp" | wc -c)
+        if fp_validate_syntax "$_sc_fp"; then
+            good "структура верна ($_sc_len байт)"
+        else
+            err "структура неверна"
+            fp_errors | sed 's/^/     /'
+            _sc_rc=1
+        fi
+
+        _sc_g() { sed -n "s/^${1}=//p" "$_sc_file" | head -1; }
+        # release берётся из @release, а не из свойства: писать
+        # ro.build.version.release запрещено (ломает совместимость
+        # приложений), но 4-е поле fingerprint обязано ему соответствовать.
+        # @release при этом отдельно сверяется с реальным устройством.
+        fp_reset_errors
+        if fp_validate_coherence "$_sc_fp" \
+            "$(_sc_g ro.product.brand)" "$(_sc_g ro.product.name)" "$(_sc_g ro.product.device)" \
+            "$(profile_meta "$_sc_file" release)" "$(_sc_g ro.build.id)" \
+            "$(_sc_g ro.build.version.incremental)" "$(_sc_g ro.build.type)" "$(_sc_g ro.build.tags)"
+        then
+            good "все 8 полей сходятся со свойствами"
+        else
+            err "fingerprint противоречит собственным свойствам"
+            fp_errors | sed 's/^/     /'
+            echo "     Приложению достаточно одной строки, чтобы это увидеть:"
+            echo "     Build.FINGERPRINT.startsWith(Build.BRAND+\"/\"+Build.PRODUCT+\"/\"+Build.DEVICE+\":\")"
+            _sc_rc=1
+        fi
+
+        fp_reset_errors
+        _sc_patch="$(_sc_g ro.build.version.security_patch)"
+        if [ -n "$_sc_patch" ]; then
+            if fp_validate_patch_date "$(_sc_g ro.build.id)" "$_sc_patch"; then
+                good "дата патча правдоподобна ($_sc_patch)"
+            else
+                err "дата патча неправдоподобна"; fp_errors | sed 's/^/     /'; _sc_rc=1
+            fi
+        fi
+    fi
+    echo
+
+    # --- 4. Совместимость с железом ----------------------------------------
+    #
+    # Профиль, противоречащий железу, не прячет устройство, а делает его
+    # уникальным: кортеж, который в природе не встречается, имеет
+    # популяцию 1.
+    echo "4. Совместимость с железом"
+
+    _sc_cmp() { # _sc_cmp <описание> <заявлено> <реально>
+        if [ -z "$2" ]; then
+            warn "$1: в профиле не указано (проверить нечем)"
+            return 0
+        fi
+        if [ "$2" = "$3" ]; then good "$1: $3"; return 0; fi
+        err "$1: профиль заявляет '$2', устройство — '$3'"
+        return 1
+    }
+
+    _sc_cmp "платформа"   "$(profile_meta "$_sc_file" platform)"  "$(dev_platform)" || _sc_rc=1
+    _sc_cmp "SoC"         "$(profile_meta "$_sc_file" soc_model)" "$(dev_soc)"      || _sc_rc=1
+    _sc_cmp "ядра"        "$(profile_meta "$_sc_file" core_count)" "$(dev_cores)"   || _sc_rc=1
+    _sc_cmp "Android"     "$(profile_meta "$_sc_file" release)"   "$(dev_release)"  || _sc_rc=1
+    _sc_cmp "панель"      "$(profile_meta "$_sc_file" display)"   "$(dev_display)"  || _sc_rc=1
+    _sc_cmp "плотность"   "$(profile_meta "$_sc_file" density)"   "$(dev_density)"  || _sc_rc=1
+    _sc_cmp "low_ram"     "$(profile_meta "$_sc_file" low_ram)"   "$(dev_low_ram)"  || _sc_rc=1
+    _sc_cmp "ABI"         "$(profile_meta "$_sc_file" abilist)"   "$(dev_abilist)"  || _sc_rc=1
+
+    # Память сравнивается с допуском: объём, заявленный в рекламе, не
+    # совпадает с MemTotal (часть съедает ядро и резервы).
+    _sc_pram="$(profile_meta "$_sc_file" ram_kb)"
+    _sc_dram="$(dev_ram_kb)"
+    if [ -n "$_sc_pram" ] && [ "$_sc_dram" -gt 0 ] 2>/dev/null; then
+        _sc_lo=$(( _sc_dram * 75 / 100 )); _sc_hi=$(( _sc_dram * 125 / 100 ))
+        if [ "$_sc_pram" -ge "$_sc_lo" ] && [ "$_sc_pram" -le "$_sc_hi" ]; then
+            good "память: ${_sc_pram} kB против ${_sc_dram} kB (в пределах 25%)"
+        else
+            err "память: профиль заявляет ${_sc_pram} kB, устройство ${_sc_dram} kB (вне 25%)"
+            echo "     MemTotal читается прямо из ядра и не подменяется."
+            _sc_rc=1
+        fi
+    else
+        warn "память: в профиле не указана"
+    fi
+
+    # Происхождение. Профиль обязан быть скопирован из реального дампа.
+    echo
+    echo "5. Происхождение"
+    _sc_prov="$(profile_meta "$_sc_file" source_sha256)"
+    if [ -n "$_sc_prov" ]; then
+        good "указан хеш исходного дампа: $(printf '%s' "$_sc_prov" | cut -c1-16)…"
+    else
+        warn "хеш исходного дампа не указан (@source_sha256)"
+        echo "     Значения должны быть скопированы из дампа реального"
+        echo "     устройства побайтово. Выдуманный fingerprint — это"
+        echo "     анонимное множество из одного элемента, то есть"
+        echo "     самоназначенный супер-кукис, переживающий переустановки"
+        echo "     и сброс рекламного ID."
+    fi
+
+    echo
+    if [ "$_sc_rc" -eq 0 ]; then
+        good "профиль прошёл все проверки"
+    else
+        err "ПРОФИЛЬ ОТВЕРГНУТ"
+        echo "  Остаться на стоке безопаснее, чем применить несогласованный профиль."
+    fi
+    return $_sc_rc
+}
+
+# ------------------------------------------------------------- команды ---
+
+cmd_status() {
+    echo "Состояние"
+    echo "========="
+    echo
+    echo "Устройство видно как:"
+    for k in ro.product.model ro.product.brand ro.product.manufacturer \
+             ro.product.device ro.product.name ro.build.fingerprint; do
+        printf '  %-28s %s\n' "$k" "$(getprop "$k")"
+    done
+    echo
+    echo "Неизменяемое:"
+    printf '  %-28s %s\n' "платформа"  "$(dev_platform)"
+    printf '  %-28s %s\n' "SoC"        "$(dev_soc)"
+    printf '  %-28s %s\n' "ядра"       "$(dev_cores)"
+    printf '  %-28s %s kB\n' "память"  "$(dev_ram_kb)"
+    printf '  %-28s %s @ %s dpi\n' "панель" "$(dev_display)" "$(dev_density)"
+    printf '  %-28s %s\n' "low_ram"    "$(dev_low_ram)"
+    echo
+
+    _sc_ov="$(dev_override)"
+    if [ -n "$_sc_ov" ]; then
+        err "АКТИВЕН OVERRIDE ЭКРАНА: $(echo "$_sc_ov" | tr '\n' ' ')"
+        echo "  Это сейчас самый заметный признак устройства — заметнее модели."
+        echo "  Исправить:  wm size reset && wm density reset"
+        echo
+    fi
+
+    if [ -f "$MODDIR/system.prop" ]; then
+        good "профиль применён ($(grep -c . "$MODDIR/system.prop") свойств)"
+    else
+        echo "  профиль не применён, модуль инертен"
+    fi
+    [ -f "$PROFILE" ] && echo "  принятый профиль: $PROFILE"
+    [ -f "$MODDIR/disable" ] && err "модуль ОТКЛЮЧЁН (сработал сторож — см. $CONF/boot.log)"
+
+    _sc_n="$(cat "$CONF/strikes" 2>/dev/null || echo 0)"
+    [ "$_sc_n" != "0" ] && warn "незавершённых загрузок подряд: $_sc_n (при 2 модуль отключится)"
+
+    if [ -f "$CONF/boot.log" ]; then
+        echo
+        echo "Последние записи журнала:"
+        tail -5 "$CONF/boot.log" | sed 's/^/  /'
+    fi
+}
+
+cmd_check()  { validate "${1:-$PROFILE}"; }
+
+cmd_import() {
+    need_root import
+    _sc_src="${1:-}"
+    [ -n "$_sc_src" ] || { err "укажи файл: spoofctl import <файл>"; exit 1; }
+    validate "$_sc_src" || { echo; err "не импортирован"; exit 1; }
+    mkdir -p "$CONF" 2>/dev/null; chmod 700 "$CONF" 2>/dev/null
+    cp "$_sc_src" "$PROFILE" && chmod 600 "$PROFILE"
+    echo; good "принят: $PROFILE"
+    echo "  применить:  spoofctl apply"
+}
+
+cmd_apply() {
+    need_root apply
+    [ -f "$PROFILE" ] || { err "профиль не импортирован (spoofctl import <файл>)"; exit 1; }
+    # Повторная проверка: устройство могло измениться с момента импорта
+    # (например, снова включили override экрана).
+    validate "$PROFILE" || { echo; err "не применён"; exit 1; }
+
+    profile_props "$PROFILE" > "$MODDIR/system.prop"
+    chmod 644 "$MODDIR/system.prop"
+    echo
+    good "записан $MODDIR/system.prop ($(grep -c . "$MODDIR/system.prop") свойств)"
+    echo "  Свойства применит Magisk на следующей загрузке (стадия apply_modules)."
+    echo "  Перезагрузись:  reboot"
+    echo
+    echo "  Если телефон не загрузится — модуль отключит себя сам после"
+    echo "  ДВУХ незавершённых загрузок подряд. Держать Volume Down с самого"
+    echo "  начала, до заставки, — принудительное отключение модулей."
+}
+
+cmd_revert() {
+    need_root revert
+    if [ -f "$MODDIR/system.prop" ]; then
+        rm -f "$MODDIR/system.prop"
+        good "профиль снят, нужна перезагрузка"
+    else
+        echo "  профиль и так не применён"
+    fi
+    rm -f "$MODDIR/disable" 2>/dev/null
+    echo 0 > "$CONF/strikes" 2>/dev/null
+}
+
+usage() {
+    cat <<'EOF'
+spoofctl — профиль идентичности устройства
+
+  spoofctl status           что видно сейчас, состояние модуля и сторожа
+  spoofctl check [файл]     проверить профиль, ничего не меняя
+  spoofctl import <файл>    проверить и принять профиль
+  spoofctl apply            применить принятый профиль (нужна перезагрузка)
+  spoofctl revert           снять профиль (нужна перезагрузка)
+
+Профиль — текстовый файл. Строки '@ключ=значение' описывают железо, которое
+должно совпасть с реальным; они проверяются, но не записываются. Остальные
+строки 'ключ=значение' — свойства, которые будут применены.
+
+  @platform=ums9230
+  @soc_model=T615
+  @core_count=8
+  @ram_kb=2855468
+  @display=720x1600
+  @density=320
+  @low_ram=true
+  @release=14
+  @abilist=arm64-v8a,armeabi-v7a,armeabi
+  @source_sha256=<хеш дампа, из которого скопированы значения>
+
+  ro.product.model=...
+  ro.build.fingerprint=...
+
+Значения обязаны быть скопированы из дампа реального устройства побайтово.
+Выдуманный профиль — анонимное множество из одного элемента.
+EOF
+}
+
+case "${1:-}" in
+    status)        shift; cmd_status "$@" ;;
+    check)         shift; cmd_check "$@" ;;
+    import)        shift; cmd_import "$@" ;;
+    apply)         shift; cmd_apply "$@" ;;
+    revert)        shift; cmd_revert "$@" ;;
+    ''|-h|--help|help) usage ;;
+    *) err "неизвестная команда: $1"; echo; usage; exit 2 ;;
+esac

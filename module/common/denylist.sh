@@ -159,35 +159,35 @@ allow_check() {
 #
 # Возвращает 1, если найден хоть один запрещённый ключ или битая строка.
 deny_scan_profile() {
-    _file="${1:-}"
-    [ -f "$_file" ] || { echo "профиль не найден: $_file"; return 1; }
+    _dl_file="${1:-}"
+    [ -f "$_dl_file" ] || { echo "профиль не найден: $_dl_file"; return 1; }
 
-    _bad=0; _warn=0; _n=0
+    _dl_bad=0; _dl_warn=0; _dl_n=0
 
-    while IFS= read -r _line || [ -n "$_line" ]; do
-        _n=$((_n + 1))
-        case "$_line" in ''|'#'*) continue ;; esac
-        case "$_line" in
+    while IFS= read -r _dl_line || [ -n "$_dl_line" ]; do
+        _dl_n=$((_dl_n + 1))
+        case "$_dl_line" in ''|'#'*) continue ;; esac
+        case "$_dl_line" in
             *=*) : ;;
-            *) echo "  строка $_n: не в формате ключ=значение: $_line"
-               _bad=$((_bad + 1)); continue ;;
+            *) echo "  строка $_dl_n: не в формате ключ=значение: $_dl_line"
+               _dl_bad=$((_dl_bad + 1)); continue ;;
         esac
 
-        _key="${_line%%=*}"
-        _key="${_key#"${_key%%[![:space:]]*}"}"
-        _key="${_key%"${_key##*[![:space:]]}"}"
-        _val="${_line#*=}"
+        _dl_key="${_dl_line%%=*}"
+        _dl_key="${_dl_key#"${_dl_key%%[![:space:]]*}"}"
+        _dl_key="${_dl_key%"${_dl_key##*[![:space:]]}"}"
+        _dl_val="${_dl_line#*=}"
 
-        if _why="$(deny_reason "$_key")"; then
-            echo "  ЗАПРЕЩЕНО  $_key"
-            echo "             $_why"
-            _bad=$((_bad + 1))
+        if _dl_why="$(deny_reason "$_dl_key")"; then
+            echo "  ЗАПРЕЩЕНО  $_dl_key"
+            echo "             $_dl_why"
+            _dl_bad=$((_dl_bad + 1))
             continue
         fi
 
-        if ! allow_check "$_key"; then
-            echo "  неизвестно $_key (нет в списке разрешённых — опечатка?)"
-            _warn=$((_warn + 1))
+        if ! allow_check "$_dl_key"; then
+            echo "  неизвестно $_dl_key (нет в списке разрешённых — опечатка?)"
+            _dl_warn=$((_dl_warn + 1))
         fi
 
         # Лимит длины значения. Строго в БАЙТАХ, не в символах.
@@ -201,19 +201,19 @@ deny_scan_profile() {
         # получают буквальную строку
         # "Must use __system_property_read_callback() to read".
         # Это максимально громкий признак подмены.
-        _len=$(printf '%s' "$_val" | wc -c)
-        if [ "$_len" -gt 91 ]; then
-            echo "  СЛИШКОМ ДЛИННО $_key: $_len байт (максимум 91)"
+        _dl_len=$(printf '%s' "$_dl_val" | wc -c)
+        if [ "$_dl_len" -gt 91 ]; then
+            echo "  СЛИШКОМ ДЛИННО $_dl_key: $_dl_len байт (максимум 91)"
             echo "             при 92+ байтах resetprop удаляет и пересоздаёт свойство;"
             echo "             старые читатели получат 'Must use __system_property_read_callback()'"
-            _bad=$((_bad + 1))
+            _dl_bad=$((_dl_bad + 1))
         fi
-    done < "$_file"
+    done < "$_dl_file"
 
-    if [ "$_bad" -gt 0 ]; then
-        echo "профиль отвергнут: проблем — $_bad"
+    if [ "$_dl_bad" -gt 0 ]; then
+        echo "профиль отвергнут: проблем — $_dl_bad"
         return 1
     fi
-    [ "$_warn" -gt 0 ] && echo "предупреждений: $_warn"
+    [ "$_dl_warn" -gt 0 ] && echo "предупреждений: $_dl_warn"
     return 0
 }
